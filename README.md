@@ -15,7 +15,7 @@ Universal API layer for React applications built on **ky**, **consola**, and **T
 ## Installation
 
 ```bash
-npm install qore
+npx degit m4es7r0/qore packages
 
 # Peer dependencies
 npm install ky consola @tanstack/react-query
