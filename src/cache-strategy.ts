@@ -46,13 +46,15 @@
  * ```ts
  * export const toggleTodoCache = createCacheStrategy<Todo, { id: string }>({
  *   invalidate: () => [todoQueries._def],
- *   optimistic: {
- *     queryKey: todoQueries.list.queryKey,
- *     updater: (variables, oldList) =>
- *       (oldList ?? []).map((t) =>
- *         t.id === variables.id ? { ...t, done: !t.done } : t,
- *       ),
- *   },
+ *   optimistic: [
+ *     {
+ *       queryKey: () => todoQueries.list.queryKey,
+ *       updater: (variables, old) =>
+ *         ((old ?? []) as Todo[]).map((t) =>
+ *           t.id === variables.id ? { ...t, done: !t.done } : t,
+ *         ),
+ *     },
+ *   ],
  * });
  * ```
  *
@@ -62,16 +64,29 @@
  * export const createOrderCache = createCacheStrategy<Order, CreateOrderParams>({
  *   invalidate: (v) => [orderQueries._def],
  *   prefetch: (v, data) => [
- *     orderQueries.detail(data.id).queryKey,  // warm the detail cache
+ *     orderQueries.detail(data.id),  // { queryKey, queryFn }
  *   ],
  * });
  * ```
  */
-import { type MutationOptions, type QueryClient } from "@tanstack/react-query";
+import {
+  type MutationOptions,
+  type QueryClient,
+  type QueryFunction,
+  type SkipToken,
+} from "@tanstack/react-query";
 
 // ---------------------------------------------------------------------------
 // CacheStrategy type
 // ---------------------------------------------------------------------------
+
+type OptimisticTarget<TVariables> = {
+  queryKey: (variables: TVariables) => readonly unknown[];
+  updater: (variables: TVariables, old: unknown) => unknown;
+};
+
+type Snapshot = { queryKey: readonly unknown[]; previous: unknown };
+type OptimisticContext = { snapshots: Snapshot[] };
 
 /**
  * Declarative description of how a mutation interacts with the query cache.
@@ -92,40 +107,55 @@ export type CacheStrategy<TData, TVariables> = {
    * ]
    * ```
    */
-  invalidate?: (variables: TVariables, data: TData) => readonly (readonly unknown[])[];
+  invalidate?: (
+    variables: TVariables,
+    data: TData,
+  ) => readonly (readonly unknown[])[];
 
   /**
-   * Optimistic update config — mutates cached data *before* the server responds.
-   * Automatically rolls back on error.
+   * Optimistic update targets — mutate cached data *before* the server responds.
+   * Supports multiple targets so a single mutation can optimistically update
+   * several caches. Automatically rolls back all targets on error.
+   *
+   * Each target's `queryKey` is a function of `variables`, enabling
+   * parameterized queries (e.g. `deployQueries.list(v.funnelId).queryKey`).
    *
    * @example
    * ```ts
-   * optimistic: {
-   *   queryKey: todoQueries.list.queryKey,
-   *   updater: (variables, oldTodos) =>
-   *     (oldTodos ?? []).map(t =>
-   *       t.id === variables.id ? { ...t, done: !t.done } : t
-   *     ),
-   * }
+   * optimistic: [
+   *   {
+   *     queryKey: () => todoQueries.list.queryKey,
+   *     updater: (variables, oldTodos) =>
+   *       ((oldTodos ?? []) as Todo[]).map(t =>
+   *         t.id === variables.id ? { ...t, done: !t.done } : t
+   *       ),
+   *   },
+   * ]
    * ```
    */
-  optimistic?: {
-    queryKey: readonly unknown[];
-    updater: (variables: TVariables, old: TData | undefined) => TData;
-  };
+  optimistic?: readonly OptimisticTarget<TVariables>[];
 
   /**
-   * Query keys to prefetch after the mutation succeeds.
+   * Queries to prefetch after the mutation succeeds.
    * Useful for warming caches of pages the user will navigate to next.
+   *
+   * Return objects with `queryKey` and an optional `queryFn` so that
+   * `prefetchQuery` can actually fetch the data.
    *
    * @example
    * ```ts
    * prefetch: (_variables, data) => [
-   *   entityQueries.detail(data.id).queryKey,
+   *   orderQueries.detail(data.id),  // { queryKey, queryFn }
    * ]
    * ```
    */
-  prefetch?: (variables: TVariables, data: TData) => readonly (readonly unknown[])[];
+  prefetch?: (
+    variables: TVariables,
+    data: TData,
+  ) => readonly {
+    queryKey: readonly unknown[];
+    queryFn?: QueryFunction | SkipToken;
+  }[];
 };
 
 // ---------------------------------------------------------------------------
@@ -256,21 +286,28 @@ export function withCacheStrategy<TData, TVariables>(
     onMutate: strategy.optimistic
       ? async (variables: TVariables) => {
           const qc = getQueryClient();
-          await qc.cancelQueries({ queryKey: strategy.optimistic!.queryKey });
-          const previous = qc.getQueryData<TData>(strategy.optimistic!.queryKey);
-          qc.setQueryData(
-            strategy.optimistic!.queryKey,
-            strategy.optimistic!.updater(variables, previous),
-          );
-          return { previous };
+          const snapshots: Snapshot[] = [];
+          for (const target of strategy.optimistic!) {
+            const key = target.queryKey(variables);
+            await qc.cancelQueries({ queryKey: key });
+            snapshots.push({
+              queryKey: key,
+              previous: qc.getQueryData(key),
+            });
+            qc.setQueryData(key, target.updater(variables, qc.getQueryData(key)));
+          }
+          return { snapshots } satisfies OptimisticContext;
         }
       : undefined,
 
     onError: strategy.optimistic
       ? (_error: Error, _variables: TVariables, context: unknown) => {
-          const ctx = context as { previous?: TData } | undefined;
-          if (ctx?.previous !== undefined) {
-            getQueryClient().setQueryData(strategy.optimistic!.queryKey, ctx.previous);
+          const ctx = context as OptimisticContext | undefined;
+          if (ctx?.snapshots) {
+            const qc = getQueryClient();
+            for (const { queryKey, previous } of ctx.snapshots) {
+              qc.setQueryData(queryKey, previous);
+            }
           }
         }
       : undefined,
@@ -283,8 +320,13 @@ export function withCacheStrategy<TData, TVariables>(
         }
       }
       if (strategy.prefetch) {
-        for (const key of strategy.prefetch(variables, data)) {
-          qc.prefetchQuery({ queryKey: key, queryFn: () => Promise.resolve(undefined) });
+        for (const target of strategy.prefetch(variables, data)) {
+          if (typeof target.queryFn === "function") {
+            qc.prefetchQuery({
+              queryKey: target.queryKey,
+              queryFn: target.queryFn,
+            });
+          }
         }
       }
     },
