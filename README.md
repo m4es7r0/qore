@@ -105,7 +105,7 @@ export const productQueries = createQueryKeys("products", (q) => ({
 
 ```ts
 // entities/product/api/cache.ts
-import { createCacheStrategy } from "qore";
+import { createCacheStrategy, cacheUpdate } from "qore";
 import type { Product } from "../model/types";
 import type { UpdateProductParams } from "./actions";
 import { productQueries } from "./queries";
@@ -114,6 +114,12 @@ export const updateProductCache = createCacheStrategy<Product, UpdateProductPara
   invalidate: (variables) => [
     productQueries._def,                          // invalidate all product queries
     productQueries.detail(variables.id).queryKey,  // also specifically this detail
+  ],
+  optimistic: [
+    // old is inferred as Product[] | undefined — no manual cast needed
+    cacheUpdate(productQueries.list, (v, old) =>
+      (old ?? []).map((p) => (p.id === v.id ? { ...p, name: v.name } : p)),
+    ),
   ],
 });
 ```
@@ -373,6 +379,44 @@ type CacheStrategy<TData, TVariables> = {
 
 ---
 
+### `cacheUpdate(query, updater)`
+
+Type-safe factory for optimistic update targets. Infers the cached data type from the query's `queryFn`, so `old` in the updater is properly typed without manual `as` casts.
+
+```ts
+import { cacheUpdate } from "qore";
+
+// Static query — old is inferred as Product[] | undefined
+cacheUpdate(productQueries.list, (v, old) =>
+  (old ?? []).map((p) => (p.id === v.id ? { ...p, name: v.name } : p)),
+)
+
+// Parameterized query — old is inferred as Product[] | undefined
+cacheUpdate(
+  (v: UpdateProductParams) => productQueries.detail(v.id),
+  (v, old) => old ? { ...old, name: v.name } : old,
+)
+```
+
+Use inside the `optimistic` array of a cache strategy:
+
+```ts
+export const updateProductCache = createCacheStrategy<Product, UpdateProductParams>({
+  invalidate: (v) => [productQueries._def],
+  optimistic: [
+    cacheUpdate(productQueries.list, (v, old) =>
+      (old ?? []).map((p) => (p.id === v.id ? { ...p, name: v.name } : p)),
+    ),
+    cacheUpdate(
+      (v: UpdateProductParams) => productQueries.detail(v.id),
+      (v, old) => old ? { ...old, name: v.name } : old,
+    ),
+  ],
+});
+```
+
+---
+
 ### `withCacheStrategy(mutationFn, strategy)`
 
 Wraps a mutation function + strategy into a `MutationOptions` factory:
@@ -498,7 +542,7 @@ export const userQueries = createQueryKeys("users", (q) => ({
 }));
 
 // --- entities/user/api/cache.ts ---
-import { createCacheStrategy } from "qore";
+import { createCacheStrategy, cacheUpdate } from "qore";
 import type { User } from "../model/types";
 import type { CreateUserParams, UpdateUserParams } from "./actions";
 import { userQueries } from "./queries";
@@ -511,6 +555,12 @@ export const updateUserCache = createCacheStrategy<User, UpdateUserParams>({
   invalidate: (v) => [
     userQueries.list.queryKey,
     userQueries.detail(v.id).queryKey,
+  ],
+  optimistic: [
+    // old is inferred as User[] | undefined
+    cacheUpdate(userQueries.list, (v, old) =>
+      (old ?? []).map((u) => (u.id === v.id ? { ...u, ...v } : u)),
+    ),
   ],
 });
 

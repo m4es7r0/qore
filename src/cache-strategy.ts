@@ -47,13 +47,11 @@
  * export const toggleTodoCache = createCacheStrategy<Todo, { id: string }>({
  *   invalidate: () => [todoQueries._def],
  *   optimistic: [
- *     {
- *       queryKey: () => todoQueries.list.queryKey,
- *       updater: (variables, old) =>
- *         ((old ?? []) as Todo[]).map((t) =>
- *           t.id === variables.id ? { ...t, done: !t.done } : t,
- *         ),
- *     },
+ *     cacheUpdate(todoQueries.list, (variables, old) =>
+ *       (old ?? []).map((t) =>
+ *         t.id === variables.id ? { ...t, done: !t.done } : t,
+ *       ),
+ *     ),
  *   ],
  * });
  * ```
@@ -123,13 +121,11 @@ export type CacheStrategy<TData, TVariables> = {
    * @example
    * ```ts
    * optimistic: [
-   *   {
-   *     queryKey: () => todoQueries.list.queryKey,
-   *     updater: (variables, oldTodos) =>
-   *       ((oldTodos ?? []) as Todo[]).map(t =>
-   *         t.id === variables.id ? { ...t, done: !t.done } : t
-   *       ),
-   *   },
+   *   cacheUpdate(todoQueries.list, (variables, old) =>
+   *     (old ?? []).map(t =>
+   *       t.id === variables.id ? { ...t, done: !t.done } : t
+   *     ),
+   *   ),
    * ]
    * ```
    */
@@ -184,6 +180,58 @@ export function createCacheStrategy<TData, TVariables>(
   strategy: CacheStrategy<TData, TVariables>,
 ): CacheStrategy<TData, TVariables> {
   return strategy;
+}
+
+// ---------------------------------------------------------------------------
+// cacheUpdate
+// ---------------------------------------------------------------------------
+
+type InferQueryData<T> = T extends { queryFn?: infer F }
+  ? Awaited<ReturnType<Extract<F, (...args: never[]) => unknown>>>
+  : unknown;
+
+/**
+ * Type-safe factory for optimistic update targets.
+ *
+ * Infers the cached data type from the query's `queryFn` return type,
+ * so `old` in the updater is properly typed without manual `as` casts.
+ *
+ * Accepts both static queries and parameterized query factories:
+ *
+ * @param query - A query options object, or a function `(variables) => queryOptions`
+ * @param updater - Receives `(variables, old)` and returns the new cache value
+ *
+ * @example
+ * ```ts
+ * // Static query — old is inferred as Todo[] | undefined
+ * cacheUpdate(todoQueries.list, (v, old) =>
+ *   (old ?? []).map(t => t.id === v.id ? { ...t, done: !t.done } : t),
+ * )
+ *
+ * // Parameterized query — old is inferred as Deploy[] | undefined
+ * cacheUpdate(
+ *   (v: RedeployParams) => deployQueries.list(v.funnelId),
+ *   (v, old) => (old ?? []).map(d => d.id === v.deployId ? { ...d, status: "deploying" } : d),
+ * )
+ * ```
+ */
+export function cacheUpdate<
+  TVariables,
+  TQuery extends { queryKey: readonly unknown[] },
+>(
+  query: TQuery | ((variables: TVariables) => TQuery),
+  updater: (
+    variables: TVariables,
+    old: InferQueryData<TQuery> | undefined,
+  ) => InferQueryData<TQuery>,
+): OptimisticTarget<TVariables> {
+  return {
+    queryKey:
+      typeof query === "function"
+        ? (v: TVariables) => (query as (v: TVariables) => TQuery)(v).queryKey
+        : () => query.queryKey,
+    updater: updater as OptimisticTarget<TVariables>["updater"],
+  };
 }
 
 // ---------------------------------------------------------------------------

@@ -50,6 +50,7 @@ export { createQueryKeys } from "./create-query-keys";
 export {
   createCacheStrategy,
   withCacheStrategy,
+  cacheUpdate,
   setQueryClient,
 } from "./cache-strategy";
 export type { CacheStrategy } from "./cache-strategy";
