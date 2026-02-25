@@ -352,14 +352,22 @@ type CacheStrategy<TData, TVariables> = {
   // Keys to invalidate after success
   invalidate?: (variables: TVariables, data: TData) => readonly (readonly unknown[])[];
 
-  // Optimistic update — applied before server responds, rolled back on error
-  optimistic?: {
-    queryKey: readonly unknown[];
-    updater: (variables: TVariables, old: TData | undefined) => TData;
-  };
+  // Optimistic updates — applied before server responds, rolled back on error
+  // Supports multiple targets and dynamic keys derived from variables
+  optimistic?: readonly {
+    queryKey: (variables: TVariables) => readonly unknown[];
+    updater: (variables: TVariables, old: unknown) => unknown;
+  }[];
 
-  // Keys to prefetch after success
-  prefetch?: (variables: TVariables, data: TData) => readonly (readonly unknown[])[];
+  // Queries to prefetch after success
+  // Provide queryKey + queryFn so prefetchQuery can execute a real request
+  prefetch?: (
+    variables: TVariables,
+    data: TData,
+  ) => readonly {
+    queryKey: readonly unknown[];
+    queryFn?: QueryFunction | SkipToken;
+  }[];
 };
 ```
 
