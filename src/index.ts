@@ -41,7 +41,7 @@ export { ApiError, toApiError } from "./api-error";
 export { logger, errorLogger, setLogLevel } from "./logger";
 
 // --- Response Types ---
-export type { ApiResponse, ApiErrorBody, PaginatedResponse } from "./types";
+export type { ApiResponse, ApiErrorBody, PaginatedResponse } from "./api-response";
 
 // --- Query Key Factory ---
 export { createQueryKeys } from "./create-query-keys";

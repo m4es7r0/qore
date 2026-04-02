@@ -21,6 +21,57 @@ npx degit m4es7r0/qore packages
 npm install ky consola @tanstack/react-query
 ```
 
+## FSD Integration
+
+qore is designed for the `shared/api/` segment in [Feature-Sliced Design](https://feature-sliced.design/) projects. Start with a minimal setup and extract layers only when the team agrees.
+
+### Minimal FSD project (shared + pages + app)
+
+```
+src/
+├── app/
+│   └── providers.tsx            ← QueryClientProvider + setQueryClient
+├── pages/
+│   └── products/
+│       ├── ui/
+│       │   └── ProductListPage.tsx
+│       ├── api/
+│       │   ├── product-actions.ts    ← fetch functions (page-local)
+│       │   ├── product-queries.ts    ← createQueryKeys (page-local)
+│       │   └── product-cache.ts      ← cache strategy (page-local)
+│       └── index.ts
+└── shared/
+    └── api/
+        ├── client.ts            ← createApiClient instance
+        ├── endpoints.ts         ← centralized endpoint paths
+        └── index.ts
+```
+
+This is a valid, complete FSD setup. Most code lives in `pages/` — extract to lower layers only when needed.
+
+### When to extract to entities
+
+Extract to `entities/` only when **2+ pages share the same business model** and the team agrees:
+
+```
+src/
+├── entities/
+│   └── product/
+│       ├── api/
+│       │   ├── product-actions.ts
+│       │   ├── product-queries.ts
+│       │   ├── product-cache.ts
+│       │   └── product-mutations.ts
+│       ├── model/
+│       │   └── product.ts           ← Product type + domain logic
+│       └── index.ts
+├── pages/
+│   ├── products/                    ← uses entities/product
+│   └── product-detail/              ← uses entities/product
+└── shared/
+    └── api/
+```
+
 ## Quick Start
 
 ### 1. Create an API client
@@ -29,7 +80,6 @@ npm install ky consola @tanstack/react-query
 // shared/api/client.ts
 import { createApiClient, setLogLevel } from "qore";
 
-// Enable verbose logging in development
 if (import.meta.env.DEV) {
   setLogLevel(4);
 }
@@ -56,13 +106,175 @@ export const endpoints = {
 } as const;
 ```
 
-### 3. Create entity actions (fetchers)
+### 3. Register QueryClient
 
 ```ts
-// entities/product/api/actions.ts
-import { api } from "@/shared/api/client";
+// app/providers.tsx
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { setQueryClient } from "qore";
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: { staleTime: 30_000, retry: 1 },
+  },
+});
+
+setQueryClient(queryClient);
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  return (
+    <QueryClientProvider client={queryClient}>
+      {children}
+    </QueryClientProvider>
+  );
+}
+```
+
+### 4. Define actions and queries (pages-first)
+
+Keep everything in the page until extraction is needed:
+
+```ts
+// pages/products/api/product-actions.ts
+import { api } from "@/shared/api";
 import { endpoints } from "@/shared/api/endpoints";
-import type { Product } from "../model/types";
+
+export type Product = {
+  id: string;
+  name: string;
+  categoryId: string;
+};
+
+export async function getProducts(): Promise<Product[]> {
+  return api.get(endpoints.products.list).json();
+}
+
+export async function getProduct(id: string): Promise<Product> {
+  return api.get(endpoints.products.detail(id)).json();
+}
+```
+
+```ts
+// pages/products/api/product-queries.ts
+import { createQueryKeys } from "qore";
+import { getProducts, getProduct } from "./product-actions";
+
+export const productQueries = createQueryKeys("products", (q) => ({
+  list: q.scope("list").query(getProducts),
+  detail: q.scope("detail").query(
+    (id: string) => [id] as const,
+    (id) => getProduct(id),
+  ),
+}));
+```
+
+### 5. Use in components
+
+```tsx
+// pages/products/ui/ProductListPage.tsx
+import { useQuery } from "@tanstack/react-query";
+import { productQueries } from "../api/product-queries";
+
+export function ProductListPage() {
+  const { data: products, isLoading } = useQuery(productQueries.list);
+
+  if (isLoading) return <div>Loading...</div>;
+
+  return (
+    <ul>
+      {products?.map((p) => (
+        <li key={p.id}>{p.name}</li>
+      ))}
+    </ul>
+  );
+}
+
+export function ProductDetail({ id }: { id: string }) {
+  const { data: product } = useQuery(productQueries.detail(id));
+
+  return <h1>{product?.name}</h1>;
+}
+```
+
+### 6. Add cache strategy for mutations
+
+```ts
+// pages/products/api/product-cache.ts
+import { createCacheStrategy, cacheUpdate } from "qore";
+import type { Product } from "./product-actions";
+import { productQueries } from "./product-queries";
+
+export type UpdateProductParams = {
+  id: string;
+  name: string;
+  categoryId: string;
+};
+
+export const updateProductCache = createCacheStrategy<Product, UpdateProductParams>({
+  invalidate: (variables) => [
+    productQueries._def,
+    productQueries.detail(variables.id).queryKey,
+  ],
+  optimistic: [
+    cacheUpdate(productQueries.list, (v, old) =>
+      (old ?? []).map((p) => (p.id === v.id ? { ...p, name: v.name } : p)),
+    ),
+  ],
+});
+```
+
+```ts
+// pages/products/api/product-mutations.ts
+import { withCacheStrategy } from "qore";
+import { api } from "@/shared/api";
+import { endpoints } from "@/shared/api/endpoints";
+import type { Product, UpdateProductParams } from "./product-actions";
+import { updateProductCache } from "./product-cache";
+
+async function updateProduct(params: UpdateProductParams): Promise<Product> {
+  return api.put(endpoints.products.detail(params.id), { json: params }).json();
+}
+
+export const updateProductMutation = withCacheStrategy(updateProduct, updateProductCache);
+```
+
+```tsx
+// pages/products/ui/ProductEditor.tsx
+import { useMutation } from "@tanstack/react-query";
+import { updateProductMutation } from "../api/product-mutations";
+
+export function ProductEditor({ id }: { id: string }) {
+  const { mutate, isPending } = useMutation(updateProductMutation());
+
+  return (
+    <button
+      disabled={isPending}
+      onClick={() => mutate({ id, name: "Updated", categoryId: "cat-1" })}
+    >
+      Update
+    </button>
+  );
+}
+```
+
+---
+
+## Evolution: Extracting to Entities
+
+When `ProductDetail` page also needs the same queries and types, extract to `entities/product/`:
+
+```ts
+// entities/product/model/product.ts
+export type Product = {
+  id: string;
+  name: string;
+  categoryId: string;
+};
+
+// entities/product/api/product-actions.ts
+import { api } from "@/shared/api";
+import { endpoints } from "@/shared/api/endpoints";
+import type { Product } from "../model/product";
 
 export async function getProducts(): Promise<Product[]> {
   return api.get(endpoints.products.list).json();
@@ -79,18 +291,12 @@ export type UpdateProductParams = {
 };
 
 export async function updateProduct(params: UpdateProductParams): Promise<Product> {
-  return api.put(endpoints.products.detail(params.id), {
-    json: params,
-  }).json();
+  return api.put(endpoints.products.detail(params.id), { json: params }).json();
 }
-```
 
-### 4. Define query keys
-
-```ts
-// entities/product/api/queries.ts
+// entities/product/api/product-queries.ts
 import { createQueryKeys } from "qore";
-import { getProducts, getProduct } from "./actions";
+import { getProducts, getProduct } from "./product-actions";
 
 export const productQueries = createQueryKeys("products", (q) => ({
   list: q.scope("list").query(getProducts),
@@ -99,107 +305,52 @@ export const productQueries = createQueryKeys("products", (q) => ({
     (id) => getProduct(id),
   ),
 }));
-```
 
-### 5. Define cache strategy + mutation
-
-```ts
-// entities/product/api/cache.ts
+// entities/product/api/product-cache.ts
 import { createCacheStrategy, cacheUpdate } from "qore";
-import type { Product } from "../model/types";
-import type { UpdateProductParams } from "./actions";
-import { productQueries } from "./queries";
+import type { Product } from "../model/product";
+import type { UpdateProductParams } from "./product-actions";
+import { productQueries } from "./product-queries";
 
 export const updateProductCache = createCacheStrategy<Product, UpdateProductParams>({
   invalidate: (variables) => [
-    productQueries._def,                          // invalidate all product queries
-    productQueries.detail(variables.id).queryKey,  // also specifically this detail
+    productQueries._def,
+    productQueries.detail(variables.id).queryKey,
   ],
   optimistic: [
-    // old is inferred as Product[] | undefined — no manual cast needed
     cacheUpdate(productQueries.list, (v, old) =>
       (old ?? []).map((p) => (p.id === v.id ? { ...p, name: v.name } : p)),
     ),
+    cacheUpdate(
+      (v: UpdateProductParams) => productQueries.detail(v.id),
+      (v, old) => old ? { ...old, name: v.name } : old,
+    ),
   ],
 });
-```
 
-```ts
-// entities/product/api/mutations.ts
+// entities/product/api/product-mutations.ts
 import { withCacheStrategy } from "qore";
-import { updateProduct } from "./actions";
-import { updateProductCache } from "./cache";
+import { updateProduct } from "./product-actions";
+import { updateProductCache } from "./product-cache";
 
 export const updateProductMutation = withCacheStrategy(updateProduct, updateProductCache);
+
+// entities/product/index.ts
+export type { Product } from "./model/product";
+export { productQueries } from "./api/product-queries";
+export { updateProductMutation } from "./api/product-mutations";
 ```
 
-### 6. Register QueryClient
-
-```ts
-// app/providers.tsx
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { setQueryClient } from "qore";
-
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: { staleTime: 30_000, retry: 1 },
-  },
-});
-
-// Register once — enables withCacheStrategy to access the cache
-setQueryClient(queryClient);
-
-export function Providers({ children }: { children: React.ReactNode }) {
-  return (
-    <QueryClientProvider client={queryClient}>
-      {children}
-    </QueryClientProvider>
-  );
-}
-```
-
-### 7. Use in components
+Now both pages import from the entity's public API:
 
 ```tsx
 // pages/products/ui/ProductListPage.tsx
+import { useQuery } from "@tanstack/react-query";
+import { productQueries } from "@/entities/product";
+
+// pages/product-detail/ui/ProductDetailPage.tsx
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { productQueries } from "@/entities/product/api/queries";
-import { updateProductMutation } from "@/entities/product/api/mutations";
-
-export function ProductListPage() {
-  // Static query — pass the options object directly
-  const { data: products, isLoading } = useQuery(productQueries.list);
-
-  if (isLoading) return <div>Loading...</div>;
-
-  return (
-    <ul>
-      {products?.map((p) => (
-        <li key={p.id}>{p.name}</li>
-      ))}
-    </ul>
-  );
-}
-
-export function ProductDetail({ id }: { id: string }) {
-  // Parameterized query — call the function
-  const { data: product } = useQuery(productQueries.detail(id));
-
-  // Mutation with automatic cache invalidation
-  const { mutate, isPending } = useMutation(updateProductMutation());
-
-  return (
-    <div>
-      <h1>{product?.name}</h1>
-      <button
-        disabled={isPending}
-        onClick={() => mutate({ id, name: "Updated", categoryId: "cat-1" })}
-      >
-        Update
-      </button>
-    </div>
-  );
-}
+import { productQueries, updateProductMutation } from "@/entities/product";
 ```
 
 ---
@@ -212,9 +363,9 @@ Creates a configured `ky` HTTP client instance.
 
 ```ts
 type ApiClientOptions = {
-  prefixUrl: string;          // Base URL for all requests
+  prefixUrl: string;            // Base URL for all requests
   middleware?: ApiMiddleware[];  // Custom middleware (appended after built-in)
-  options?: ky.Options;       // Raw ky options (override anything)
+  options?: ky.Options;         // Raw ky options (override anything)
 };
 ```
 
@@ -359,14 +510,12 @@ type CacheStrategy<TData, TVariables> = {
   invalidate?: (variables: TVariables, data: TData) => readonly (readonly unknown[])[];
 
   // Optimistic updates — applied before server responds, rolled back on error
-  // Supports multiple targets and dynamic keys derived from variables
   optimistic?: readonly {
     queryKey: (variables: TVariables) => readonly unknown[];
     updater: (variables: TVariables, old: unknown) => unknown;
   }[];
 
   // Queries to prefetch after success
-  // Provide queryKey + queryFn so prefetchQuery can execute a real request
   prefetch?: (
     variables: TVariables,
     data: TData,
@@ -391,28 +540,11 @@ cacheUpdate(productQueries.list, (v, old) =>
   (old ?? []).map((p) => (p.id === v.id ? { ...p, name: v.name } : p)),
 )
 
-// Parameterized query — old is inferred as Product[] | undefined
+// Parameterized query — old is inferred as Product | undefined
 cacheUpdate(
   (v: UpdateProductParams) => productQueries.detail(v.id),
   (v, old) => old ? { ...old, name: v.name } : old,
 )
-```
-
-Use inside the `optimistic` array of a cache strategy:
-
-```ts
-export const updateProductCache = createCacheStrategy<Product, UpdateProductParams>({
-  invalidate: (v) => [productQueries._def],
-  optimistic: [
-    cacheUpdate(productQueries.list, (v, old) =>
-      (old ?? []).map((p) => (p.id === v.id ? { ...p, name: v.name } : p)),
-    ),
-    cacheUpdate(
-      (v: UpdateProductParams) => productQueries.detail(v.id),
-      (v, old) => old ? { ...old, name: v.name } : old,
-    ),
-  ],
-});
 ```
 
 ---
@@ -441,145 +573,14 @@ setQueryClient(queryClient);
 
 ---
 
-## Architecture: Recommended FSD Layout
+## Layer Responsibilities
 
-```
-src/
-├── app/
-│   └── providers.tsx           # QueryClientProvider + setQueryClient
-├── shared/
-│   └── api/
-│       ├── client.ts           # createApiClient instance
-│       ├── endpoints.ts        # all API paths
-│       └── index.ts            # re-exports
-├── entities/
-│   └── product/
-│       ├── model/
-│       │   └── types.ts        # Product type
-│       ├── api/
-│       │   ├── actions.ts      # getProducts, getProduct, updateProduct
-│       │   ├── queries.ts      # productQueries (createQueryKeys)
-│       │   ├── cache.ts        # updateProductCache (createCacheStrategy)
-│       │   └── mutations.ts    # updateProductMutation (withCacheStrategy)
-│       ├── ui/
-│       │   └── ProductCard.tsx
-│       └── index.ts
-├── features/
-│   └── edit-product/
-│       ├── model/
-│       │   └── use-edit-product.ts  # useMutation(updateProductMutation())
-│       └── ui/
-│           └── EditProductForm.tsx
-└── pages/
-    └── products/
-        └── ui/
-            └── ProductListPage.tsx   # useQuery(productQueries.list)
-```
-
-### Layer responsibilities
-
-| Layer        | Contains                                | Uses from `qore` |
-|-------------|----------------------------------------|-------------------------------|
-| `shared/api` | Client instance, endpoints             | `createApiClient`             |
-| `entities/*/api` | Actions, queries, cache, mutations | `createQueryKeys`, `createCacheStrategy`, `withCacheStrategy` |
-| `features`   | Mutation hooks, business logic         | –                             |
-| `pages`      | `useQuery()`, page composition         | –                             |
-
----
-
-## Full Example: CRUD Entity
-
-Here's a complete example of setting up a `User` entity:
-
-```ts
-// --- entities/user/model/types.ts ---
-export type User = {
-  id: string;
-  name: string;
-  email: string;
-  role: "admin" | "user";
-};
-
-// --- entities/user/api/actions.ts ---
-import { api } from "@/shared/api";
-import { endpoints } from "@/shared/api/endpoints";
-import type { User } from "../model/types";
-
-export async function getUsers(): Promise<User[]> {
-  return api.get(endpoints.users.list).json();
-}
-
-export async function getUser(id: string): Promise<User> {
-  return api.get(endpoints.users.detail(id)).json();
-}
-
-export type CreateUserParams = { name: string; email: string; role: User["role"] };
-
-export async function createUser(params: CreateUserParams): Promise<User> {
-  return api.post(endpoints.users.list, { json: params }).json();
-}
-
-export type UpdateUserParams = { id: string } & Partial<CreateUserParams>;
-
-export async function updateUser(params: UpdateUserParams): Promise<User> {
-  return api.put(endpoints.users.detail(params.id), { json: params }).json();
-}
-
-export async function deleteUser(id: string): Promise<void> {
-  await api.delete(endpoints.users.detail(id));
-}
-
-// --- entities/user/api/queries.ts ---
-import { createQueryKeys } from "qore";
-import { getUsers, getUser } from "./actions";
-
-export const userQueries = createQueryKeys("users", (q) => ({
-  list: q.scope("list").query(getUsers),
-  detail: q.scope("detail").query(
-    (id: string) => [id] as const,
-    (id) => getUser(id),
-  ),
-}));
-
-// --- entities/user/api/cache.ts ---
-import { createCacheStrategy, cacheUpdate } from "qore";
-import type { User } from "../model/types";
-import type { CreateUserParams, UpdateUserParams } from "./actions";
-import { userQueries } from "./queries";
-
-export const createUserCache = createCacheStrategy<User, CreateUserParams>({
-  invalidate: () => [userQueries._def],
-});
-
-export const updateUserCache = createCacheStrategy<User, UpdateUserParams>({
-  invalidate: (v) => [
-    userQueries.list.queryKey,
-    userQueries.detail(v.id).queryKey,
-  ],
-  optimistic: [
-    // old is inferred as User[] | undefined
-    cacheUpdate(userQueries.list, (v, old) =>
-      (old ?? []).map((u) => (u.id === v.id ? { ...u, ...v } : u)),
-    ),
-  ],
-});
-
-export const deleteUserCache = createCacheStrategy<void, string>({
-  invalidate: (id) => [
-    userQueries.list.queryKey,
-    userQueries.detail(id).queryKey,
-  ],
-});
-
-// --- entities/user/api/mutations.ts ---
-import { withCacheStrategy } from "qore";
-import { createUser, updateUser, deleteUser } from "./actions";
-import { createUserCache, updateUserCache, deleteUserCache } from "./cache";
-
-export const createUserMutation = withCacheStrategy(createUser, createUserCache);
-export const updateUserMutation = withCacheStrategy(updateUser, updateUserCache);
-export const deleteUserMutation = withCacheStrategy(deleteUser, deleteUserCache);
-```
+| Layer              | What goes here                               | Uses from qore                                                  |
+|--------------------|----------------------------------------------|-----------------------------------------------------------------|
+| `shared/api/`     | Client instance, endpoints                   | `createApiClient`, `setLogLevel`                                |
+| `pages/*/api/`    | Page-local actions, queries, cache, mutations | `createQueryKeys`, `createCacheStrategy`, `cacheUpdate`, `withCacheStrategy` |
+| `entities/*/api/` | Extracted when shared by 2+ pages            | Same as pages                                                   |
+| `app/`            | QueryClient registration                     | `setQueryClient`                                                |
 
 ---
 

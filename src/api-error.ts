@@ -29,7 +29,7 @@
  * ```
  */
 import { HTTPError, TimeoutError } from "ky";
-import type { ApiErrorBody } from "./types";
+import type { ApiErrorBody } from "./api-response";
 
 /**
  * Normalized API error with status, code, typed body, and convenience flags.
