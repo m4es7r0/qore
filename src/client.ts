@@ -124,12 +124,20 @@ export const loggingMiddleware: ApiMiddleware = {
   // `request.url`, not `response.url`: the request one is always present
   // (mocked fetches leave `response.url` empty) and matches the `→` line.
   afterResponse: ({ request, response }) => {
-    logger.debug(`← ${response.status} ${pathOf(request.url)}${takeDuration(request)}`);
+    logger.debug(
+      `← ${response.status} ${pathOf(request.url)}${takeDuration(request)}`,
+    );
   },
   beforeError: ({ request, error }) => {
     if (isHTTPError(error)) {
+      if (error.response.status === 401) {
+        logger.debug(`✗ ${request.method} ${pathOf(request.url)} → 401`);
+        return error;
+      }
       // The response line above already carried the duration.
-      errorLogger.error(`${request.method} ${pathOf(request.url)} → ${error.response.status}`);
+      errorLogger.error(
+        `${request.method} ${pathOf(request.url)} → ${error.response.status}`,
+      );
     } else {
       // No response ever arrived — settle the in-flight entry here.
       errorLogger.error(
